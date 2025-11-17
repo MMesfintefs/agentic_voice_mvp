@@ -1,2 +1,4 @@
-openai==1.60.1
-streamlit==1.40.1
+streamlit
+openai>=1.40.0
+duckduckgo-search
+pydantic
