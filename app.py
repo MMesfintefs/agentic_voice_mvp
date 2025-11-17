@@ -1,5 +1,6 @@
 # app.py
 import os
+import tempfile
 from typing import Any, Dict, List
 
 import streamlit as st
@@ -16,7 +17,6 @@ def get_openai_client() -> OpenAI:
     """
     api_key = None
 
-    # Try Streamlit secrets first (recommended for Streamlit Cloud)
     if "OPENAI_API_KEY" in st.secrets:
         api_key = st.secrets["OPENAI_API_KEY"]
     else:
@@ -49,6 +49,49 @@ def web_search(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
                 {"title": r.get("title"), "href": r.get("href"), "body": r.get("body")}
             )
     return results
+
+
+# =========================
+# AUDIO HELPERS (PHASE 2B)
+# =========================
+
+def transcribe_audio_file(uploaded_file) -> str:
+    """
+    Send an uploaded audio file to OpenAI for transcription.
+    Supports mp3, wav, m4a, etc. (whatever the API accepts).
+    """
+    # Streamlit's UploadedFile is file-like, we can pass it directly.
+    transcript = client.audio.transcriptions.create(
+        model="gpt-4o-mini-transcribe",
+        file=uploaded_file,
+    )
+    # API returns an object with .text
+    return getattr(transcript, "text", str(transcript))
+
+
+def synthesize_speech(text: str) -> bytes:
+    """
+    Turn reply text into speech using OpenAI TTS and return raw audio bytes.
+    We write to a temp .mp3 then read it back for st.audio().
+    """
+    # Temp file path
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp_path = tmp.name
+    tmp.close()
+
+    response = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=text,
+    )
+
+    # Official helper to write to file, then we read bytes
+    response.stream_to_file(tmp_path)
+
+    with open(tmp_path, "rb") as f:
+        audio_bytes = f.read()
+
+    return audio_bytes
 
 
 # =========================
@@ -133,10 +176,8 @@ class VoiceAgent:
         tools_output = None
 
         if intent == "web_search":
-            # Simple tool call example
             tools_output = web_search(user_text)
 
-        # Build system prompt to expose the structure
         system_prompt = (
             "You are an agentic voice assistant. You receive a perception and reasoning "
             "object and must respond to the user. "
@@ -145,18 +186,9 @@ class VoiceAgent:
         )
 
         messages = [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_text,
-            },
-            {
-                "role": "system",
-                "content": f"Perception object: {reasoning}",
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+            {"role": "system", "content": f"Perception & reasoning object: {reasoning}"},
         ]
 
         if tools_output is not None:
@@ -192,7 +224,7 @@ class VoiceAgent:
 
 
 # =========================
-# STREAMLIT UI
+# STREAMLIT STATE & UI
 # =========================
 
 def init_session_state():
@@ -203,34 +235,40 @@ def init_session_state():
 
 
 def main():
-    st.set_page_config(page_title="Agentic Assistant – Phase 1", page_icon="🤖")
-    st.title("🤖 Agentic Voice Assistant (Phase 1: Text Only)")
+    st.set_page_config(page_title="Agentic Voice Assistant", page_icon="🤖")
+    st.title("🤖 Agentic Voice Assistant")
 
     init_session_state()
+    agent: VoiceAgent = st.session_state.agent
 
     st.markdown(
         """
-        This is the **Phase 1** scaffold:
-        - Perceive → Reason → Act loop
-        - Optional web search tool
-        - Text-only for now (voice comes later)
+        This app runs an **agentic assistant** with:
+
+        - Perceive → Reason → Act loop  
+        - Optional web search tool  
+        - **Text chat** and **voice via uploaded audio**  
         """
     )
+
+    # -------------------------
+    # TEXT CHAT (PHASE 1)
+    # -------------------------
+    st.subheader("💬 Text mode")
 
     with st.form("chat_form", clear_on_submit=True):
         user_input = st.text_area("Type your message:", height=100)
         submitted = st.form_submit_button("Send")
 
     if submitted and user_input.strip():
-        agent: VoiceAgent = st.session_state.agent
-
-        with st.spinner("Thinking like an overworked intern..."):
+        with st.spinner("Thinking..."):
             perception = agent.perceive(user_input)
             reasoning = agent.reason(perception)
             result = agent.act(reasoning)
 
         st.session_state.history.append(
             {
+                "mode": "text",
                 "user": user_input,
                 "perception": perception,
                 "reasoning": reasoning,
@@ -238,12 +276,79 @@ def main():
             }
         )
 
-    # Show history
+    # -------------------------
+    # VOICE VIA UPLOADED AUDIO (PHASE 2B)
+    # -------------------------
+    st.subheader("🎤 Voice mode (upload audio file)")
+
+    st.markdown(
+        "Upload a short voice clip (mp3 / wav / m4a). "
+        "I'll **transcribe → reason → reply → speak back**."
+    )
+
+    audio_file = st.file_uploader(
+        "Upload audio",
+        type=["mp3", "wav", "m4a", "mp4", "mpeg", "mpga", "webm"],
+    )
+
+    if st.button("Transcribe & respond (voice)"):
+
+        if audio_file is None:
+            st.warning("Upload an audio file first.")
+        else:
+            # 1) Transcribe
+            with st.spinner("Transcribing your audio..."):
+                transcript_text = transcribe_audio_file(audio_file)
+
+            st.markdown("**Transcribed text:**")
+            st.write(transcript_text)
+
+            # 2) Run through agent pipeline
+            with st.spinner("Thinking about your audio..."):
+                perception_v = agent.perceive(transcript_text)
+                reasoning_v = agent.reason(perception_v)
+                result_v = agent.act(reasoning_v)
+
+            reply_text = result_v["reply"]
+
+            st.markdown("**Assistant (text reply):**")
+            st.write(reply_text)
+
+            # 3) Text-to-speech reply
+            with st.spinner("Generating spoken reply..."):
+                reply_audio = synthesize_speech(reply_text)
+
+            st.markdown("**Assistant (voice reply):**")
+            st.audio(reply_audio, format="audio/mp3")
+
+            # Save in history
+            st.session_state.history.append(
+                {
+                    "mode": "voice",
+                    "user": f"[Voice] {audio_file.name}",
+                    "transcript": transcript_text,
+                    "perception": perception_v,
+                    "reasoning": reasoning_v,
+                    "result": result_v,
+                }
+            )
+
+    # -------------------------
+    # HISTORY & INTERNALS
+    # -------------------------
     if st.session_state.history:
         st.subheader("Conversation & Agent Reasoning")
+
         for i, turn in enumerate(reversed(st.session_state.history), start=1):
-            st.markdown(f"### Turn {i}")
-            st.markdown(f"**You:** {turn['user']}")
+            mode_label = "🎤 Voice" if turn.get("mode") == "voice" else "💬 Text"
+            st.markdown(f"### Turn {i} {mode_label}")
+
+            if turn.get("mode") == "voice":
+                st.markdown(f"**You (audio):** {turn['user']}")
+                st.markdown(f"**Transcript:** {turn.get('transcript', '')}")
+            else:
+                st.markdown(f"**You:** {turn['user']}")
+
             st.markdown(f"**Assistant:** {turn['result']['reply']}")
 
             with st.expander("Perception & Plan (agent internals)"):
