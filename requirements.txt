@@ -5,3 +5,5 @@ pydantic
 streamlit-webrtc
 soundfile
 numpy
+av
+pydub
