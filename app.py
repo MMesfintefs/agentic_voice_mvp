@@ -1,5 +1,9 @@
-# app.py
+# =========================
+# Agentic Voice Assistant – Full App (Text + Upload Voice + Auto-Mic Mode)
+# =========================
+
 import os
+import time
 import tempfile
 from typing import Any, Dict, List
 
@@ -7,14 +11,17 @@ import streamlit as st
 from openai import OpenAI
 from duckduckgo_search import DDGS
 
+import numpy as np
+import av
+from pydub import AudioSegment
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
+
+
 # =========================
-# CONFIG & CLIENT
+# CLIENT SETUP
 # =========================
 
 def get_openai_client() -> OpenAI:
-    """
-    Get OpenAI client from Streamlit secrets or env.
-    """
     api_key = None
 
     if "OPENAI_API_KEY" in st.secrets:
@@ -23,10 +30,7 @@ def get_openai_client() -> OpenAI:
         api_key = os.getenv("OPENAI_API_KEY")
 
     if not api_key:
-        st.error(
-            "OPENAI_API_KEY not found. "
-            "Add it to Streamlit secrets or environment variables."
-        )
+        st.error("OPENAI_API_KEY not found in secrets.")
         st.stop()
 
     return OpenAI(api_key=api_key)
@@ -34,14 +38,12 @@ def get_openai_client() -> OpenAI:
 
 client = get_openai_client()
 
+
 # =========================
-# SIMPLE TOOL: WEB SEARCH
+# TOOLS
 # =========================
 
 def web_search(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
-    """
-    Basic DuckDuckGo search as an example tool the agent can call.
-    """
     results = []
     with DDGS() as ddgs:
         for r in ddgs.text(query, max_results=max_results):
@@ -52,29 +54,18 @@ def web_search(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
 
 
 # =========================
-# AUDIO HELPERS (PHASE 2B)
+# AUDIO HELPERS
 # =========================
 
 def transcribe_audio_file(uploaded_file) -> str:
-    """
-    Send an uploaded audio file to OpenAI for transcription.
-    Supports mp3, wav, m4a, etc. (whatever the API accepts).
-    """
-    # Streamlit's UploadedFile is file-like, we can pass it directly.
     transcript = client.audio.transcriptions.create(
         model="gpt-4o-mini-transcribe",
         file=uploaded_file,
     )
-    # API returns an object with .text
     return getattr(transcript, "text", str(transcript))
 
 
 def synthesize_speech(text: str) -> bytes:
-    """
-    Turn reply text into speech using OpenAI TTS and return raw audio bytes.
-    We write to a temp .mp3 then read it back for st.audio().
-    """
-    # Temp file path
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     tmp_path = tmp.name
     tmp.close()
@@ -84,8 +75,6 @@ def synthesize_speech(text: str) -> bytes:
         voice="alloy",
         input=text,
     )
-
-    # Official helper to write to file, then we read bytes
     response.stream_to_file(tmp_path)
 
     with open(tmp_path, "rb") as f:
@@ -95,109 +84,76 @@ def synthesize_speech(text: str) -> bytes:
 
 
 # =========================
-# AGENT CLASS (PERCEIVE → REASON → ACT)
+# AGENT (PERCEIVE → REASON → ACT)
 # =========================
 
 class VoiceAgent:
     def __init__(self):
-        # Very dumb memory list for now
         self.memory: List[Dict[str, Any]] = []
 
-    # ---------- PERCEIVE ----------
     def perceive(self, text: str) -> Dict[str, Any]:
         lowered = text.lower()
 
         if any(w in lowered for w in ["summarize", "summary"]):
             intent = "summarize"
-        elif any(w in lowered for w in ["calculate", "compute", "math", "number"]):
+        elif any(w in lowered for w in ["calculate", "compute", "math"]):
             intent = "calculate"
-        elif any(w in lowered for w in ["search", "google", "web", "online"]):
+        elif any(w in lowered for w in ["search", "google", "web"]):
             intent = "web_search"
         else:
             intent = "chat"
 
-        perception = {
+        return {
             "intent": intent,
             "entities": {"text": text},
             "sentiment": "neutral",
             "raw_text": text,
         }
-        return perception
 
-    # ---------- REASON ----------
     def reason(self, perception: Dict[str, Any]) -> Dict[str, Any]:
         intent = perception["intent"]
         text = perception["entities"]["text"]
 
         if intent == "summarize":
-            goal = "Provide a clear, short summary of the user's text or topic."
-            plan_steps = [
-                "Identify the main topic or question.",
-                "Extract key points.",
-                "Condense into 2–4 concise sentences.",
-            ]
+            goal = "Provide a concise summary."
+            steps = ["Find main idea", "Extract key points", "Summarize"]
         elif intent == "calculate":
-            goal = "Perform a calculation or quantitative reasoning task."
-            plan_steps = [
-                "Identify the numerical values and relationships.",
-                "Formulate the calculation.",
-                "Compute the result and explain briefly.",
-            ]
+            goal = "Perform numerical reasoning."
+            steps = ["Identify numbers", "Compute", "Explain result"]
         elif intent == "web_search":
-            goal = "Search the web for up-to-date or factual information."
-            plan_steps = [
-                "Turn the user's request into a concise search query.",
-                "Call the web_search tool.",
-                "Summarize the top results for the user.",
-            ]
+            goal = "Search the web."
+            steps = ["Generate query", "Search", "Summarize output"]
         else:
-            goal = "Engage in helpful conversation and answer the user's question."
-            plan_steps = [
-                "Understand the user's question or request.",
-                "Retrieve any relevant memory or context.",
-                "Provide a helpful, direct answer.",
-            ]
+            goal = "Help with natural conversation."
+            steps = ["Understand request", "Use context", "Reply"]
 
-        reasoning = {
+        return {
             "goal": goal,
-            "plan": {"steps": plan_steps, "intent": intent, "original_text": text},
-            "confidence": 0.8,  # placeholder
+            "plan": {"steps": steps, "intent": intent, "original_text": text},
+            "confidence": 0.8,
         }
-        return reasoning
 
-    # ---------- ACT ----------
     def act(self, reasoning: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Decide whether to call tools and then call the LLM with full context.
-        """
         intent = reasoning["plan"]["intent"]
         user_text = reasoning["plan"]["original_text"]
 
         tools_output = None
-
         if intent == "web_search":
             tools_output = web_search(user_text)
 
         system_prompt = (
-            "You are an agentic voice assistant. You receive a perception and reasoning "
-            "object and must respond to the user. "
-            "Use the provided plan and any tool results. "
-            "Be concise, clear, and actionable."
+            "You are an agentic assistant. Use the perception and reasoning objects "
+            "to form a helpful response."
         )
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
-            {"role": "system", "content": f"Perception & reasoning object: {reasoning}"},
+            {"role": "system", "content": f"Perception & reasoning: {reasoning}"},
         ]
 
-        if tools_output is not None:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": f"Tool results: {tools_output}",
-                }
-            )
+        if tools_output:
+            messages.append({"role": "system", "content": f"Tool results: {tools_output}"})
 
         completion = client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -206,12 +162,8 @@ class VoiceAgent:
 
         reply = completion.choices[0].message.content
 
-        result = {
-            "reply": reply,
-            "tools_output": tools_output,
-        }
+        result = {"reply": reply, "tools_output": tools_output}
 
-        # Save to memory (very naive)
         self.memory.append(
             {
                 "user": user_text,
@@ -224,141 +176,163 @@ class VoiceAgent:
 
 
 # =========================
-# STREAMLIT STATE & UI
+# SESSION STATE
 # =========================
 
-def init_session_state():
+def init_state():
     if "agent" not in st.session_state:
         st.session_state.agent = VoiceAgent()
     if "history" not in st.session_state:
         st.session_state.history = []
+    if "voice_buffer" not in st.session_state:
+        st.session_state.voice_buffer = []
+    if "last_audio_time" not in st.session_state:
+        st.session_state.last_audio_time = time.time()
+    if "processing" not in st.session_state:
+        st.session_state.processing = False
 
+
+# =========================
+# MAIN APP
+# =========================
 
 def main():
     st.set_page_config(page_title="Agentic Voice Assistant", page_icon="🤖")
     st.title("🤖 Agentic Voice Assistant")
 
-    init_session_state()
-    agent: VoiceAgent = st.session_state.agent
+    init_state()
+    agent = st.session_state.agent
 
-    st.markdown(
-        """
-        This app runs an **agentic assistant** with:
-
-        - Perceive → Reason → Act loop  
-        - Optional web search tool  
-        - **Text chat** and **voice via uploaded audio**  
-        """
-    )
+    st.markdown("Text chat, upload voice, and full auto-microphone mode.")
 
     # -------------------------
-    # TEXT CHAT (PHASE 1)
+    # TEXT CHAT
     # -------------------------
-    st.subheader("💬 Text mode")
+    st.subheader("💬 Text Mode")
 
     with st.form("chat_form", clear_on_submit=True):
-        user_input = st.text_area("Type your message:", height=100)
-        submitted = st.form_submit_button("Send")
+        text_in = st.text_area("Message:", height=100)
+        send = st.form_submit_button("Send")
 
-    if submitted and user_input.strip():
-        with st.spinner("Thinking..."):
-            perception = agent.perceive(user_input)
-            reasoning = agent.reason(perception)
-            result = agent.act(reasoning)
+    if send and text_in.strip():
+        perception = agent.perceive(text_in)
+        reasoning = agent.reason(perception)
+        result = agent.act(reasoning)
 
-        st.session_state.history.append(
-            {
-                "mode": "text",
-                "user": user_input,
-                "perception": perception,
-                "reasoning": reasoning,
-                "result": result,
-            }
-        )
+        st.session_state.history.append({
+            "mode": "text",
+            "user": text_in,
+            "perception": perception,
+            "reasoning": reasoning,
+            "result": result,
+        })
+
+        st.write(result["reply"])
 
     # -------------------------
-    # VOICE VIA UPLOADED AUDIO (PHASE 2B)
+    # UPLOAD AUDIO MODE
     # -------------------------
-    st.subheader("🎤 Voice mode (upload audio file)")
+    st.subheader("🎤 Upload Voice Clip")
 
-    st.markdown(
-        "Upload a short voice clip (mp3 / wav / m4a). "
-        "I'll **transcribe → reason → reply → speak back**."
-    )
+    audio_file = st.file_uploader("Upload audio", type=["mp3", "wav", "m4a", "webm"])
 
-    audio_file = st.file_uploader(
-        "Upload audio",
-        type=["mp3", "wav", "m4a", "mp4", "mpeg", "mpga", "webm"],
-    )
+    if st.button("Transcribe & Respond (Upload)") and audio_file:
+        transcript = transcribe_audio_file(audio_file)
+        st.write("**You said:**", transcript)
 
-    if st.button("Transcribe & respond (voice)"):
+        perception = agent.perceive(transcript)
+        reasoning = agent.reason(perception)
+        result = agent.act(reasoning)
 
-        if audio_file is None:
-            st.warning("Upload an audio file first.")
-        else:
-            # 1) Transcribe
-            with st.spinner("Transcribing your audio..."):
-                transcript_text = transcribe_audio_file(audio_file)
+        st.write("**Assistant:**", result["reply"])
 
-            st.markdown("**Transcribed text:**")
-            st.write(transcript_text)
+        reply_audio = synthesize_speech(result["reply"])
+        st.audio(reply_audio, format="audio/mp3")
 
-            # 2) Run through agent pipeline
-            with st.spinner("Thinking about your audio..."):
-                perception_v = agent.perceive(transcript_text)
-                reasoning_v = agent.reason(perception_v)
-                result_v = agent.act(reasoning_v)
+    # -------------------------
+    # AUTO VOICE MODE
+    # -------------------------
+    st.subheader("🎙️ Auto Voice Mode (Hands-Free)")
 
-            reply_text = result_v["reply"]
+    st.markdown("Speak → stop → auto transcribe → auto reply → auto TTS.")
 
-            st.markdown("**Assistant (text reply):**")
-            st.write(reply_text)
+    def audio_frame_callback(frame):
+        audio = frame.to_ndarray()
+        rms = np.sqrt(np.mean(audio ** 2))
 
-            # 3) Text-to-speech reply
-            with st.spinner("Generating spoken reply..."):
-                reply_audio = synthesize_speech(reply_text)
-
-            st.markdown("**Assistant (voice reply):**")
-            st.audio(reply_audio, format="audio/mp3")
-
-            # Save in history
-            st.session_state.history.append(
-                {
-                    "mode": "voice",
-                    "user": f"[Voice] {audio_file.name}",
-                    "transcript": transcript_text,
-                    "perception": perception_v,
-                    "reasoning": reasoning_v,
-                    "result": result_v,
-                }
+        if rms > 50:
+            st.session_state.voice_buffer.append(
+                audio.flatten().astype(np.int16).tobytes()
             )
+            st.session_state.last_audio_time = time.time()
+
+        return av.AudioFrame.from_ndarray(audio, layout="mono")
+
+    webrtc_ctx = webrtc_streamer(
+        key="auto-mic",
+        mode=WebRtcMode.SENDRECV,
+        audio_frame_callback=audio_frame_callback,
+        media_stream_constraints={"audio": True, "video": False},
+    )
+
+    SILENCE_TIMEOUT = 1.5
+
+    if webrtc_ctx and not st.session_state.processing:
+        if (
+            st.session_state.voice_buffer
+            and time.time() - st.session_state.last_audio_time > SILENCE_TIMEOUT
+        ):
+            st.session_state.processing = True
+            try:
+                st.write("🧩 Processing speech...")
+
+                raw = b"".join(st.session_state.voice_buffer)
+                st.session_state.voice_buffer = []
+
+                tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+                with open(tmp_wav, "wb") as f:
+                    f.write(raw)
+
+                sound = AudioSegment.from_file(tmp_wav, format="wav")
+                fixed_path = tmp_wav.replace(".wav", "_fixed.wav")
+                sound.export(fixed_path, format="wav")
+
+                with st.spinner("📝 Transcribing..."):
+                    with open(fixed_path, "rb") as af:
+                        transcript = transcribe_audio_file(af)
+
+                st.write("**You said:**", transcript)
+
+                with st.spinner("🤖 Thinking..."):
+                    perception = agent.perceive(transcript)
+                    reasoning = agent.reason(perception)
+                    result = agent.act(reasoning)
+
+                st.write("**Assistant:**", result["reply"])
+
+                with st.spinner("🗣️ Speaking..."):
+                    reply_audio = synthesize_speech(result["reply"])
+
+                st.audio(reply_audio, format="audio/mp3")
+
+            finally:
+                st.session_state.processing = False
 
     # -------------------------
-    # HISTORY & INTERNALS
+    # HISTORY
     # -------------------------
-    if st.session_state.history:
-        st.subheader("Conversation & Agent Reasoning")
+    st.subheader("Conversation Log")
 
-        for i, turn in enumerate(reversed(st.session_state.history), start=1):
-            mode_label = "🎤 Voice" if turn.get("mode") == "voice" else "💬 Text"
-            st.markdown(f"### Turn {i} {mode_label}")
-
-            if turn.get("mode") == "voice":
-                st.markdown(f"**You (audio):** {turn['user']}")
-                st.markdown(f"**Transcript:** {turn.get('transcript', '')}")
-            else:
-                st.markdown(f"**You:** {turn['user']}")
-
-            st.markdown(f"**Assistant:** {turn['result']['reply']}")
-
-            with st.expander("Perception & Plan (agent internals)"):
-                st.json(
-                    {
-                        "perception": turn["perception"],
-                        "reasoning": turn["reasoning"],
-                        "tools_output": turn["result"]["tools_output"],
-                    }
-                )
+    for i, turn in enumerate(reversed(st.session_state.history), start=1):
+        st.markdown(f"### Turn {i} ({turn['mode']})")
+        st.write("**You:**", turn["user"])
+        st.write("**Assistant:**", turn["result"]["reply"])
+        with st.expander("Internals"):
+            st.json({
+                "perception": turn["perception"],
+                "reasoning": turn["reasoning"],
+                "tools_output": turn["result"]["tools_output"],
+            })
 
 
 if __name__ == "__main__":
