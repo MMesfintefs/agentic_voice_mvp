@@ -2,7 +2,7 @@ import streamlit as st
 from openai import OpenAI
 
 client = OpenAI()
-
+st.write("OpenAI SDK version:", openai.__version__)
 st.title("Ultra-Simple Agentic Assistant")
 
 user_input = st.text_input("Say something:")
