@@ -1,8 +1,9 @@
 import os
+import tempfile
 import streamlit as st
 from openai import OpenAI
 
-# Setup client
+# setup client
 def get_client():
     key = st.secrets["OPENAI_API_KEY"] if "OPENAI_API_KEY" in st.secrets else os.getenv("OPENAI_API_KEY")
     if not key:
@@ -12,54 +13,73 @@ def get_client():
 
 client = get_client()
 
-# Agent class
+# simple agent
 class SimpleAgent:
     def __init__(self):
-        self.memory = []
+        self.memory = []  # store past chats
 
-    # Perceive
-    def perceive(self, text: str):
+    # perceive step
+    def perceive(self, text):
         intent = "chat"
         if "search" in text.lower():
             intent = "search"
-        return {"intent": intent, "text": text}
+        return {"intent": intent, "text": text}  # simple perception
 
-    # Reason
+    # reason step
     def reason(self, perception):
+        goal = "Talk normally"
         if perception["intent"] == "search":
-            goal = "Find information"
-        else:
-            goal = "Have conversation"
-        plan = ["Understand input", "Generate response"]
-        return {"goal": goal, "plan": plan, "perception": perception}
+            goal = "Find info"
+        plan = ["Understand user", "Generate answer"]
+        return {"goal": goal, "plan": plan, "text": perception["text"]}
 
-    # Act
+    # act step
     def act(self, reasoning):
-        user_text = reasoning["perception"]["text"]
-        # For simplicity, we do not call a search tool here
         messages = [
             {"role": "system", "content": f"Goal: {reasoning['goal']}"},
-            {"role": "user", "content": user_text}
+            {"role": "user", "content": reasoning["text"]}
         ]
-        completion = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages
         )
-        reply = completion.choices[0].message.content
-        # Save memory
-        self.memory.append({"user": user_text, "reply": reply})
+        reply = response.choices[0].message.content
+        self.memory.append({"user": reasoning["text"], "reply": reply})
         return reply
 
 agent = SimpleAgent()
 
-# Streamlit UI
-st.title("Agentic Voice AI – Simple Version")
+# page title
+st.title("Voice AI")   # three-word comment: “Simple app header”
 
-user_input = st.text_input("You:")  # three-word comment: “Input user text”
+# text chat
+st.subheader("Text Chat")  # three-word comment: “Text section header”
+text_in = st.text_input("You:")  # three-word comment: “User text input”
 
-if user_input:
-    # run pipeline
-    perception = agent.perceive(user_input)      # three-word comment: “Detect intent text”
-    reasoning = agent.reason(perception)          # three-word comment: “Plan next step”
-    reply = agent.act(reasoning)                  # three-word comment: “Call LLM reply”
-    st.write("Assistant:", reply)                 # three-word comment: “Show assistant reply”
+if text_in:
+    p = agent.perceive(text_in)        # three-word comment: “Detect intent basic”
+    r = agent.reason(p)                # three-word comment: “Plan assistant behavior”
+    reply = agent.act(r)               # three-word comment: “LLM final reply”
+    st.write("Assistant:", reply)      # three-word comment: “Show text output”
+
+
+# voice upload mode
+st.subheader("Voice Input")  # three-word comment: “Voice section header”
+
+audio_file = st.file_uploader("Upload audio file:", type=["mp3", "wav", "m4a"])  # upload
+
+def transcribe(file):
+    return client.audio.transcriptions.create(
+        model="gpt-4o-mini-transcribe",
+        file=file
+    ).text
+
+def speak(text):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+    audio = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=text,
+    )
+    audio.stream_to_file(tmp)
+    w
