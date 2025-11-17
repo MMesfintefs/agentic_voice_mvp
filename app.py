@@ -1,133 +1,260 @@
+# app.py
+import os
+from typing import Any, Dict, List
+
+import streamlit as st
+from openai import OpenAI
+from duckduckgo_search import DDGS
+
+# =========================
+# CONFIG & CLIENT
+# =========================
+
+def get_openai_client() -> OpenAI:
+    """
+    Get OpenAI client from Streamlit secrets or env.
+    """
+    api_key = None
+
+    # Try Streamlit secrets first (recommended for Streamlit Cloud)
+    if "OPENAI_API_KEY" in st.secrets:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        st.error(
+            "OPENAI_API_KEY not found. "
+            "Add it to Streamlit secrets or environment variables."
+        )
+        st.stop()
+
+    return OpenAI(api_key=api_key)
+
+
+client = get_openai_client()
+
+# =========================
+# SIMPLE TOOL: WEB SEARCH
+# =========================
+
+def web_search(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
+    """
+    Basic DuckDuckGo search as an example tool the agent can call.
+    """
+    results = []
+    with DDGS() as ddgs:
+        for r in ddgs.text(query, max_results=max_results):
+            results.append(
+                {"title": r.get("title"), "href": r.get("href"), "body": r.get("body")}
+            )
+    return results
+
+
+# =========================
+# AGENT CLASS (PERCEIVE → REASON → ACT)
+# =========================
+
 class VoiceAgent:
     def __init__(self):
-        self.memory = []
-        self.context = {}
-        self.tools = {}
-        self.goals = []
+        # Very dumb memory list for now
+        self.memory: List[Dict[str, Any]] = []
 
-    def perceive(self, audio_input: str) -> Dict[str, Any]:
-        intent = self._extract_intent(audio_input)
-        entities = self._extract_entities(audio_input)
-        sentiment = self._analyze_sentiment(audio_input)
+    # ---------- PERCEIVE ----------
+    def perceive(self, text: str) -> Dict[str, Any]:
+        lowered = text.lower()
+
+        if any(w in lowered for w in ["summarize", "summary"]):
+            intent = "summarize"
+        elif any(w in lowered for w in ["calculate", "compute", "math", "number"]):
+            intent = "calculate"
+        elif any(w in lowered for w in ["search", "google", "web", "online"]):
+            intent = "web_search"
+        else:
+            intent = "chat"
+
         perception = {
-            'text': audio_input,
-            'intent': intent,
-            'entities': entities,
-            'sentiment': sentiment,
-            'timestamp': datetime.now().isoformat()
+            "intent": intent,
+            "entities": {"text": text},
+            "sentiment": "neutral",
+            "raw_text": text,
         }
-        self.memory.append(perception)
         return perception
 
-    def _extract_intent(self, text: str) -> str:
-        text_lower = text.lower()
-        intent_patterns = {
-            'create': ['create', 'make', 'generate', 'write'],
-            'search': ['search', 'find', 'look for', 'show me'],
-            'analyze': ['analyze', 'explain', 'understand', 'what is'],
-            'calculate': ['calculate', 'compute', 'how much', 'sum'],
-            'schedule': ['schedule', 'plan', 'set reminder', 'meeting'],
-            'translate': ['translate', 'say in', 'convert to'],
-            'summarize': ['summarize', 'brief', 'tldr', 'overview']
-        }
-        for intent, keywords in intent_patterns.items():
-            if any(kw in text_lower for kw in keywords):
-                return intent
-        return 'conversation'
+    # ---------- REASON ----------
+    def reason(self, perception: Dict[str, Any]) -> Dict[str, Any]:
+        intent = perception["intent"]
+        text = perception["entities"]["text"]
 
-    def _extract_entities(self, text: str) -> Dict[str, List[str]]:
-        entities = {
-            'numbers': re.findall(r'\d+', text),
-            'dates': re.findall(r'\b\d{1,2}/\d{1,2}/\d{2,4}\b', text),
-            'times': re.findall(r'\b\d{1,2}:\d{2}\s*(?:am|pm)?\b', text.lower()),
-            'emails': re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
-        }
-        return {k: v for k, v in entities.items() if v}
+        if intent == "summarize":
+            goal = "Provide a clear, short summary of the user's text or topic."
+            plan_steps = [
+                "Identify the main topic or question.",
+                "Extract key points.",
+                "Condense into 2–4 concise sentences.",
+            ]
+        elif intent == "calculate":
+            goal = "Perform a calculation or quantitative reasoning task."
+            plan_steps = [
+                "Identify the numerical values and relationships.",
+                "Formulate the calculation.",
+                "Compute the result and explain briefly.",
+            ]
+        elif intent == "web_search":
+            goal = "Search the web for up-to-date or factual information."
+            plan_steps = [
+                "Turn the user's request into a concise search query.",
+                "Call the web_search tool.",
+                "Summarize the top results for the user.",
+            ]
+        else:
+            goal = "Engage in helpful conversation and answer the user's question."
+            plan_steps = [
+                "Understand the user's question or request.",
+                "Retrieve any relevant memory or context.",
+                "Provide a helpful, direct answer.",
+            ]
 
-    def _analyze_sentiment(self, text: str) -> str:
-        positive = ['good', 'great', 'excellent', 'happy', 'love', 'thank']
-        negative = ['bad', 'terrible', 'sad', 'hate', 'angry', 'problem']
-        text_lower = text.lower()
-        pos_count = sum(1 for word in positive if word in text_lower)
-        neg_count = sum(1 for word in negative if word in text_lower)
-        if pos_count > neg_count:
-            return 'positive'
-        elif neg_count > pos_count:
-            return 'negative'
-        return 'neutral'
-
-    # ✅ FIXED: moved inside class
-    def reason(self, perception: Dict) -> Dict[str, Any]:
-        intent = perception['intent']
         reasoning = {
-            'goal': self._identify_goal(intent),
-            'prerequisites': self._check_prerequisites(intent),
-            'plan': self._create_plan(intent, perception['entities']),
-            'confidence': self._calculate_confidence(perception)
+            "goal": goal,
+            "plan": {"steps": plan_steps, "intent": intent, "original_text": text},
+            "confidence": 0.8,  # placeholder
         }
         return reasoning
 
-    # ✅ FIXED: moved inside class
-    def act(self, reasoning: Dict) -> str:
-        plan = reasoning['plan']
-        results = []
-        for step in plan['steps']:
-            result = self._execute_step(step)
-            results.append(result)
-        response = self._generate_response(results, reasoning)
-        return response
+    # ---------- ACT ----------
+    def act(self, reasoning: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Decide whether to call tools and then call the LLM with full context.
+        """
+        intent = reasoning["plan"]["intent"]
+        user_text = reasoning["plan"]["original_text"]
 
-    # ====== INTERNAL HELPERS (also moved inside class) ======
+        tools_output = None
 
-    def _identify_goal(self, intent: str) -> str:
-        goal_mapping = {
-            'create': 'Generate new content',
-            'search': 'Retrieve information',
-            'analyze': 'Understand and explain',
-            'calculate': 'Perform computation',
-            'schedule': 'Organize time-based tasks',
-            'translate': 'Convert between languages',
-            'summarize': 'Condense information'
+        if intent == "web_search":
+            # Simple tool call example
+            tools_output = web_search(user_text)
+
+        # Build system prompt to expose the structure
+        system_prompt = (
+            "You are an agentic voice assistant. You receive a perception and reasoning "
+            "object and must respond to the user. "
+            "Use the provided plan and any tool results. "
+            "Be concise, clear, and actionable."
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_text,
+            },
+            {
+                "role": "system",
+                "content": f"Perception object: {reasoning}",
+            },
+        ]
+
+        if tools_output is not None:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Tool results: {tools_output}",
+                }
+            )
+
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+        )
+
+        reply = completion.choices[0].message.content
+
+        result = {
+            "reply": reply,
+            "tools_output": tools_output,
         }
-        return goal_mapping.get(intent, 'Assist user')
 
-    def _check_prerequisites(self, intent: str) -> List[str]:
-        prereqs = {
-            'search': ['internet access', 'search tool'],
-            'calculate': ['math processor'],
-            'translate': ['translation model'],
-            'schedule': ['calendar access']
-        }
-        return prereqs.get(intent, ['language understanding'])
+        # Save to memory (very naive)
+        self.memory.append(
+            {
+                "user": user_text,
+                "reasoning": reasoning,
+                "result": result,
+            }
+        )
 
-    def _create_plan(self, intent: str, entities: Dict) -> Dict:
-        plans = {
-            'create': {'steps': ['understand_requirements', 'generate_content', 'validate_output'], 'estimated_time': '10s'},
-            'analyze': {'steps': ['parse_input', 'analyze_components', 'synthesize_explanation'], 'estimated_time': '5s'},
-            'calculate': {'steps': ['extract_numbers', 'determine_operation', 'compute_result'], 'estimated_time': '2s'}
-        }
-        default_plan = {'steps': ['understand_query', 'process_information', 'formulate_response'], 'estimated_time': '3s'}
-        return plans.get(intent, default_plan)
+        return result
 
-    def _calculate_confidence(self, perception: Dict) -> float:
-        base_confidence = 0.7
-        if perception['entities']:
-            base_confidence += 0.15
-        if perception['sentiment'] != 'neutral':
-            base_confidence += 0.1
-        if len(perception['text'].split()) > 5:
-            base_confidence += 0.05
-        return min(base_confidence, 1.0)
 
-    def _execute_step(self, step: str) -> Dict:
-        return {'step': step, 'status': 'completed', 'output': f'Executed {step}'}
+# =========================
+# STREAMLIT UI
+# =========================
 
-    def _generate_response(self, results: List, reasoning: Dict) -> str:
-        intent = reasoning['goal']
-        confidence = reasoning['confidence']
-        prefix = "I understand you want to" if confidence > 0.8 else "I think you're asking me to"
-        response = f"{prefix} {intent.lower()}. "
-        if len(self.memory) > 1:
-            response += "Based on our conversation, "
-        response += f"I've analyzed your request and completed {len(results)} steps. "
-        return response
+def init_session_state():
+    if "agent" not in st.session_state:
+        st.session_state.agent = VoiceAgent()
+    if "history" not in st.session_state:
+        st.session_state.history = []
+
+
+def main():
+    st.set_page_config(page_title="Agentic Assistant – Phase 1", page_icon="🤖")
+    st.title("🤖 Agentic Voice Assistant (Phase 1: Text Only)")
+
+    init_session_state()
+
+    st.markdown(
+        """
+        This is the **Phase 1** scaffold:
+        - Perceive → Reason → Act loop
+        - Optional web search tool
+        - Text-only for now (voice comes later)
+        """
+    )
+
+    with st.form("chat_form", clear_on_submit=True):
+        user_input = st.text_area("Type your message:", height=100)
+        submitted = st.form_submit_button("Send")
+
+    if submitted and user_input.strip():
+        agent: VoiceAgent = st.session_state.agent
+
+        with st.spinner("Thinking like an overworked intern..."):
+            perception = agent.perceive(user_input)
+            reasoning = agent.reason(perception)
+            result = agent.act(reasoning)
+
+        st.session_state.history.append(
+            {
+                "user": user_input,
+                "perception": perception,
+                "reasoning": reasoning,
+                "result": result,
+            }
+        )
+
+    # Show history
+    if st.session_state.history:
+        st.subheader("Conversation & Agent Reasoning")
+        for i, turn in enumerate(reversed(st.session_state.history), start=1):
+            st.markdown(f"### Turn {i}")
+            st.markdown(f"**You:** {turn['user']}")
+            st.markdown(f"**Assistant:** {turn['result']['reply']}")
+
+            with st.expander("Perception & Plan (agent internals)"):
+                st.json(
+                    {
+                        "perception": turn["perception"],
+                        "reasoning": turn["reasoning"],
+                        "tools_output": turn["result"]["tools_output"],
+                    }
+                )
+
+
+if __name__ == "__main__":
+    main()
