@@ -2,3 +2,6 @@ streamlit
 openai>=1.40.0
 duckduckgo-search
 pydantic
+streamlit-webrtc
+soundfile
+numpy
